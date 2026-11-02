@@ -154,6 +154,14 @@ export class ZcodeExecutor implements Executor {
     const assignment = work.kind === 'start' ? latestAssignment(ticket) : runningAssignment(ticket)
     return assignment?.id === work.assignmentId && (work.kind === 'start' ? assignment.state === 'pending' : true) ? assignment : undefined
   }
+  /**
+   * run 结束后的可上报校验。首发在 assignmentStarted 之后 assignment 已是 running（真 Engine 的领域语义），
+   * 不能复用派发时点的 pending 校验；prepare 早失败时它仍是 pending，两种都要放行，只排除已结束与被替换。
+   */
+  private reportableAssignment(ticket: Ticket, work: QueuedWork): Assignment | undefined {
+    const assignment = work.kind === 'start' ? latestAssignment(ticket) : runningAssignment(ticket)
+    return assignment?.id === work.assignmentId && assignment.state !== 'ended' ? assignment : undefined
+  }
   private async dispatch(work: QueuedWork, entry: RunEntry): Promise<void> {
     try {
       if (work.kind === 'start') await this.runStart(work, entry)
@@ -209,7 +217,7 @@ export class ZcodeExecutor implements Executor {
   private finish(work: QueuedWork, entry: RunEntry, outcome: ZcodeRunResult): void {
     if (entry.stopped) return
     const ticket = this.host.store.tickets.get(work.ticketId)
-    if (!ticket || !liveTicket(ticket) || !this.currentAssignment(ticket, work)) return
+    if (!ticket || !liveTicket(ticket) || !this.reportableAssignment(ticket, work)) return
     if (outcome.sessionId) this.sessions.set(work.ticketId, outcome.sessionId)
     const report = mapToWorkerReport({ parsed: parseResultBlock(outcome.resultText), exitCode: outcome.exitCode, timedOut: outcome.timedOut })
     if (work.kind === 'start') {
@@ -227,7 +235,7 @@ export class ZcodeExecutor implements Executor {
     try {
       if (entry.stopped) return
       const ticket = this.host.store.tickets.get(work.ticketId)
-      if (!ticket || !liveTicket(ticket) || !this.currentAssignment(ticket, work)) return
+      if (!ticket || !liveTicket(ticket) || !this.reportableAssignment(ticket, work)) return
       this.host.store.atomic(() => { this.host.engine.report(work.ticketId, { state: 'failed', summary: String(error) }) })
     } catch { /* 票在检查与报告之间结束：Engine 的 report 会抛 UserError，此时无票可报，安静放弃。 */ }
   }

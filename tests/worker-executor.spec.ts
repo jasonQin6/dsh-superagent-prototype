@@ -75,7 +75,7 @@ function fakeSubprocess() {
 interface Recorded { call: string, args: unknown[] }
 
 /** 一套端口级 harness：fake subprocess + 录音 engine + 手工 store，装配出被测的 ZcodeExecutor。 */
-function harness(options: { settings?: Settings, tickets?: Ticket[], lifetime?: AbortSignal } = {}) {
+function harness(options: { settings?: Settings, tickets?: Ticket[], lifetime?: AbortSignal, stateful?: boolean } = {}) {
   const log: Recorded[] = []
   const record = (call: string) => (...args: unknown[]) => { log.push({ call, args }) }
   const store = {
@@ -90,6 +90,17 @@ function harness(options: { settings?: Settings, tickets?: Ticket[], lifetime?: 
     inputsRead: record('inputsRead'),
     turnEnded: record('turnEnded'),
     report: record('report'),
+  }
+  // 真 Engine 的 assignmentStarted 会把 assignment 置为 running（assignments.ts 的领域语义）；
+  // 录音 fake 默认不做，stateful 模式模拟这一翻转，否则 finish 路径的回归会被录音 fake 掩盖。
+  if (options.stateful) {
+    const recorded = engine.assignmentStarted
+    engine.assignmentStarted = (...args: unknown[]) => {
+      const [ticketId, assignmentId] = args as [string, string]
+      const started = options.tickets?.find(ticket => ticket.id === ticketId)?.assignments.find(assignment => assignment.id === assignmentId)
+      if (started) started.state = 'running'
+      recorded(...args)
+    }
   }
   const fake = fakeSubprocess()
   const host = {
@@ -120,6 +131,22 @@ describe('ZcodeExecutor.start', () => {
     await eventually(() => log.length >= 3)
     expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report'])
     expect(log[2]!.args).toEqual([t.id, { state: 'ready', summary: 'summary: it is done\nbranch: wt-main\nhead: abc1234' }])
+  })
+  it('reports through a stateful engine that has flipped the assignment to running (regression)', async () => {
+    const t = ticket('t1')
+    const { executor, log, fake } = harness({ tickets: [t], stateful: true })
+    executor.start(t, t.assignments[0]!)
+    await eventually(() => fake.spawns.length === 1)
+    fake.spawns[0]!.settle({ exitCode: 1, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 1)
+    const run = zcodeRuns(fake)[0]!
+    run.write(`${resultLine('sess_1', readyText)}\n`)
+    run.settle({ exitCode: 0, signal: null })
+    await eventually(() => log.length >= 3)
+    // assignmentStarted 之后 assignment 已是 running：finish 不得再要求 pending 才上报。
+    expect(t.assignments[0]!.state).toBe('running')
+    expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report'])
+    expect(log[2]!.args[1]).toMatchObject({ state: 'ready' })
   })
   it('marks the ticket failed without retrying when the prepare command fails', async () => {
     const t = ticket('t1')
