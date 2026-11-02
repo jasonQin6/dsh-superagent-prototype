@@ -251,6 +251,56 @@ describe('ZcodeExecutor.deliver', () => {
     // 做不到就不发起任何进程，也不走 deliveryFailed。
     expect(fake.spawns.length).toBe(0)
   })
+  it('queues a delivery that arrives mid-run and resumes it once the run settles (regression)', async () => {
+    const t = ticket('t1')
+    const { executor, log, fake } = harness({ tickets: [t], stateful: true })
+    executor.start(t, t.assignments[0]!)
+    await eventually(() => fake.spawns.length === 1)
+    fake.spawns[0]!.settle({ exitCode: 1, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 1)
+    const first = zcodeRuns(fake)[0]!
+    // run 在飞时人的消息进来了：真 Engine 会在 assignmentStarted 里同步回调 deliver（assignment 已翻 running）。
+    t.inputs.push({ id: 'i1', kind: 'text', text: 'also do X', at: '2026-01-01T01:00:00Z' })
+    t.undelivered.push('i1')
+    executor.deliver(t, t.assignments[0]!)
+    await wait(30)
+    // 在飞的 deliver 不报 blocked、不另起进程：仍是首发那一个 run 在跑。
+    expect(zcodeRuns(fake).length).toBe(1)
+    expect(log.some(entry => entry.call === 'report')).toBe(false)
+    // 首发以 blocked 收尾（票保持打开、assignment 仍 running），随后排队的 deliver 续跑把输入带给 worker。
+    first.write(`${resultLine('sess_1', ['RESULT', 'status: blocked', 'summary: need the file name', 'branch: none', 'head: none', 'pr: none', 'next: none'].join('\n'))}\n`)
+    first.settle({ exitCode: 0, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 2)
+    const resume = zcodeRuns(fake)[1]!
+    expect(resume.spec.argv[resume.spec.argv.indexOf('--resume') + 1]).toBe('sess_1')
+    expect(resume.spec.argv[resume.spec.argv.indexOf('-p') + 1]).toContain('also do X')
+    resume.write(`${resultLine('sess_1', readyText)}\n`)
+    resume.settle({ exitCode: 0, signal: null })
+    await eventually(() => log.some(entry => entry.call === 'inputsRead'))
+    expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report', 'inputsDelivered', 'inputsRead', 'report'])
+  })
+  it('dispatches another ticket\'s start while a same-ticket delivery waits behind its own run', async () => {
+    const t1 = ticket('t1'), t2 = ticket('t2')
+    const { executor, fake } = harness({ settings: settings({ maxWorkers: 2 }), tickets: [t1, t2], stateful: true })
+    executor.start(t1, t1.assignments[0]!)
+    await eventually(() => fake.spawns.length === 1)
+    fake.spawns[0]!.settle({ exitCode: 1, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 1)
+    t1.inputs.push({ id: 'i1', kind: 'text', text: 'later', at: '2026-01-01T01:00:00Z' })
+    t1.undelivered.push('i1')
+    executor.deliver(t1, t1.assignments[0]!)
+    // t1 的 deliver 被自己的在飞 run 挡在队首；t2 的 start 不得被它挡住（prepare 的 spawn 要出现）。
+    executor.start(t2, t2.assignments[0]!)
+    await eventually(() => fake.spawns.length === 3)
+    fake.spawns[2]!.settle({ exitCode: 1, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 2)
+    // 收尾两个 run，避免悬挂的轮询。
+    zcodeRuns(fake)[0]!.write(`${resultLine('sess_1', readyText)}\n`)
+    zcodeRuns(fake)[0]!.settle({ exitCode: 0, signal: null })
+    zcodeRuns(fake)[1]!.write(`${resultLine('sess_2', readyText)}\n`)
+    zcodeRuns(fake)[1]!.settle({ exitCode: 0, signal: null })
+    await wait(50)
+  })
 })
 
 describe('ZcodeExecutor.stop', () => {
@@ -288,5 +338,25 @@ describe('ZcodeExecutor lifetime', () => {
     expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report'])
     expect(log[2]!.args[1]).toMatchObject({ state: 'failed' })
     expect(String((log[2]!.args[1] as { summary: string }).summary)).toContain('被终止')
+  })
+  it('drops queued work without dispatching or reporting once the host lifetime aborted', async () => {
+    const controller = new AbortController()
+    const t = ticket('t1')
+    const { executor, log, fake } = harness({ tickets: [t], stateful: true, lifetime: controller.signal })
+    executor.start(t, t.assignments[0]!)
+    await eventually(() => fake.spawns.length === 1)
+    fake.spawns[0]!.settle({ exitCode: 1, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 1)
+    // run 在飞时排队一个 deliver，然后宿主停止。
+    t.inputs.push({ id: 'i1', kind: 'text', text: 'late', at: '2026-01-01T01:00:00Z' })
+    t.undelivered.push('i1')
+    executor.deliver(t, t.assignments[0]!)
+    controller.abort()
+    // 在飞 run 被 lifetime 中止结算成一条 failed；排队的 deliver 被丢弃：不派发、不 inputsDelivered、不再报告。
+    await eventually(() => log.length >= 3)
+    await wait(60)
+    expect(zcodeRuns(fake).length).toBe(1)
+    expect(log.filter(entry => entry.call === 'report').length).toBe(1)
+    expect(log.some(entry => entry.call === 'inputsDelivered')).toBe(false)
   })
 })

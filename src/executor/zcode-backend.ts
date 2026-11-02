@@ -15,6 +15,8 @@ const STDERR_MAX_BYTES = 1 << 16
 const POLL_MS = 10
 /** 与 runAsWorker 一致的宽限，让 provider 在进程退出后排干管道。 */
 const GRACE_MS = 2000
+/** 附进失败 summary 的 stderr 末尾长度：归因够用即可，不把整段噪声搬进报告。 */
+const STDERR_TAIL_CHARS = 2000
 
 export interface ZcodeArgvOptions { brief: string, cwd: string, resume?: string, command?: string }
 
@@ -40,6 +42,10 @@ export interface ZcodeRunResult {
   sessionId?: string
   /** 最后一行 result 事件的 response 文本；取不到为空串。 */
   resultText: string
+  /** stderr 的末尾片段：失败归因往往藏在最后几行，供 WorkerReport 的 summary 附带。 */
+  stderrTail: string
+  /** stdout 曾滑出收集窗口（超上限被截）：RESULT 块若因此缺失，失败 summary 需要如实归因。 */
+  lossy: boolean
   lines: ZcodeLine[]
 }
 
@@ -85,8 +91,10 @@ export function runZcodeRun(subprocess: SubprocessRuntime, { argv, cwd, signal, 
   const lines: ZcodeLine[] = []
   let offset = 0
   let tail = ''
+  let lossy = false
   const poll = (): void => {
     const read = handle.collected.stdout?.readFrom(offset)
+    if (read?.lossy) lossy = true
     if (!read?.text) return
     offset = read.nextOffset
     tail += read.text
@@ -104,7 +112,8 @@ export function runZcodeRun(subprocess: SubprocessRuntime, { argv, cwd, signal, 
     poll()
     // 没有换行结尾的残余也算一行；坏行会以 { raw } 兜住。
     if (tail) lines.push(parseLine(tail))
-    return { exitCode: outcome.exitCode, timedOut, ...lastResult(lines), lines }
+    const stderr = handle.collected.stderr?.readFrom(0)
+    return { exitCode: outcome.exitCode, timedOut, lossy, stderrTail: stderr?.text?.slice(-STDERR_TAIL_CHARS) ?? '', ...lastResult(lines), lines }
   })
   // terminate 是 seam 的唯一终止动词且本身幂等；再守一层，让 stop 可重复调用而终止只发生一次。
   let stopped = false

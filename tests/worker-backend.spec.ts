@@ -116,6 +116,20 @@ describe('runZcodeRun', () => {
     run.stop()
     expect(fake.spawns[0]!.terminate).toHaveBeenCalledTimes(1)
   })
+  it('carries a bounded stderr tail and notes stdout that dropped out of the collection window', async () => {
+    const fake = fakeSubprocess()
+    const run = runZcodeRun(fake.runtime, { argv, cwd: '/repo', signal: new AbortController().signal, timeoutMs: 5000 })
+    await wait()
+    fake.spawns[0]!.fail('noise\n'.repeat(500) + 'boom\n')
+    fake.spawns[0]!.markLossy()
+    fake.spawns[0]!.settle({ exitCode: 3, signal: null })
+    const outcome = await run.done
+    expect(outcome.exitCode).toBe(3)
+    expect(outcome.lossy).toBe(true)
+    // 只保留末尾片段：失败归因够用，不把整段噪声搬进报告。
+    expect(outcome.stderrTail.length).toBeLessThanOrEqual(2000)
+    expect(outcome.stderrTail.endsWith('boom\n')).toBe(true)
+  })
 })
 
 interface FakeSpec {
@@ -133,19 +147,25 @@ interface FakeOutcome { exitCode: number | null, signal: string | null }
  * "被停"结算；输出与退出由测试用 write/settle 手动驱动。
  */
 function fakeSubprocess() {
-  const spawns: { spec: FakeSpec, write(chunk: string): void, settle(outcome: FakeOutcome): void, terminate: Mock<() => void> }[] = []
+  const spawns: { spec: FakeSpec, write(chunk: string): void, fail(chunk: string): void, markLossy(): void,
+    settle(outcome: FakeOutcome): void, terminate: Mock<() => void> }[] = []
   const spawn = vi.fn((spec: FakeSpec) => {
     let text = ''
+    let err = ''
+    let lossy = false
     let resolve!: (outcome: FakeOutcome) => void
     const done = new Promise<FakeOutcome>(res => { resolve = res })
     spec.signal?.addEventListener('abort', () => resolve({ exitCode: null, signal: 'SIGTERM' }), { once: true })
     const terminate: Mock<() => void> = vi.fn(() => resolve({ exitCode: null, signal: 'SIGTERM' }))
-    spawns.push({ spec, write: chunk => { text += chunk }, settle: resolve, terminate })
+    spawns.push({
+      spec, write: chunk => { text += chunk }, fail: chunk => { err += chunk }, markLossy: () => { lossy = true },
+      settle: resolve, terminate,
+    })
     return {
       done, terminate,
       collected: {
-        stdout: { readFrom: (offset: number) => ({ text: text.slice(offset), nextOffset: text.length, lossy: false }) },
-        stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        stdout: { readFrom: (offset: number) => ({ text: text.slice(offset), nextOffset: text.length, lossy }) },
+        stderr: { readFrom: () => ({ text: err, nextOffset: err.length, lossy: false }) },
       },
     }
   })

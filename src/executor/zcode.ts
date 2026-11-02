@@ -43,17 +43,18 @@ interface RunEntry {
   stopped: boolean
   done?: Promise<unknown>
 }
-/** deliver 做不到续跑的两个原因；能续跑时返回 undefined。 */
-const deliveryBlocker = (inFlight: boolean, sessionId: string | undefined): string | undefined => inFlight
-  ? '输入未投递：该 ticket 的 zcode run 仍在进行中，无法续跑。'
-  : sessionId === undefined ? '输入未投递：该 ticket 还没有可续跑的 zcode 会话（上次 run 未产生 sessionId）。' : undefined
+/** deliver 做不到续跑的原因；能续跑时返回 undefined。run 在飞不算：那种 deliver 留在队列里等 run 结束后续跑。 */
+const deliveryBlocker = (sessionId: string | undefined): string | undefined =>
+  sessionId === undefined ? '输入未投递：该 ticket 还没有可续跑的 zcode 会话（上次 run 未产生 sessionId）。' : undefined
 
 /**
  * A zcode-backed executor: `start` launches one zcode run per assignment and `deliver` resumes the ticket's recorded
  * zcode session with the undelivered inputs, both through an in-memory queue driven under the `maxWorkers` limit.
- * A `blocked` delivery is reported instead of `deliveryFailed` because resuming into a running turn has no covered
- * semantics yet (ADR-0011), and a failed launch is reported without retries because a half-prepared workspace must not
- * be treated as prepared. `prepare` fills the ticket's execution metadata through the shared execution contract.
+ * A delivery that arrives while the ticket's run is in flight waits in the queue and resumes once that run settles,
+ * because the first run's brief carries only the assignment text; one with no session to resume reports `blocked`
+ * instead of `deliveryFailed` (ADR-0011), and a failed launch is reported without retries because a half-prepared
+ * workspace must not be treated as prepared. `prepare` fills the ticket's execution metadata through the shared
+ * execution contract.
  */
 export class ZcodeExecutor implements Executor {
   /** The zcode CLI command this executor runs, with a leading `~` expanded. */
@@ -112,32 +113,31 @@ export class ZcodeExecutor implements Executor {
   /** The number of tickets holding a worker slot right now. */
   activeCount(): number { return this.runs.size }
   /**
-   * Dispatches from the queue's head while work is dispatchable: work whose ticket ended or whose assignment was
-   * replaced is dropped silently, a delivery that cannot resume reports `blocked`, and the rest waits for a slot within
-   * `maxWorkers`. The slot is reserved synchronously so two dispatches cannot take the last one.
+   * Dispatches from the queue while work is dispatchable: work whose ticket ended or whose assignment was replaced is
+   * dropped silently, the rest waits for a slot within `maxWorkers`. A delivery whose ticket has a run in flight stays
+   * queued and is picked up by the pump that runs when that run settles — reporting it `blocked` instead would
+   * structurally starve inputs that arrive between `assignmentStarted` and the run's spawn, because the first run's
+   * brief carries only the assignment text. Work whose ticket is not in flight but sits behind a blocked queue head is
+   * still dispatched (the queue only orders per-ticket fairness, not global blocking). The slot is reserved
+   * synchronously so two dispatches cannot take the last one. After the host lifetime aborted nothing is dispatched:
+   * the runtime is stopping and queued work must not write new reports into it.
    */
   private pump(): void {
     for (;;) {
-      const work = this.waiting[0]
-      if (!work) return
-      const ticket = this.host.store.tickets.get(work.ticketId)
-      if (!ticket || !liveTicket(ticket) || !this.currentAssignment(ticket, work)) { this.waiting.shift(); continue }
-      if (work.kind === 'deliver') {
-        const blocker = deliveryBlocker(this.runs.has(work.ticketId), this.sessions.get(work.ticketId))
-        if (blocker) {
-          this.waiting.shift()
-          // 防御：检查与报告虽在同一段同步代码里，但报告本身可能被 Engine 拒绝（如票恰好结束）；从 dispatch 的
-          // finally 进来的 pump 一旦抛出，队列就没人再驱动了，所以这里必须吞掉。
-          try { this.host.store.atomic(() => { this.host.engine.report(work.ticketId, { state: 'blocked', summary: blocker }) }) }
-          catch { /* 无票可报，放弃即可。 */ }
-          continue
-        }
+      if (this.host.lifetime.aborted) { this.waiting.length = 0; return }
+      while (this.waiting.length) {
+        const head = this.waiting[0]!
+        const ticket = this.host.store.tickets.get(head.ticketId)
+        if (ticket && liveTicket(ticket) && this.currentAssignment(ticket, head)) break
+        this.waiting.shift()
       }
+      if (!this.waiting.length) return
       if (this.runs.size >= this.host.store.settings().executor.maxWorkers) return
-      // 一个 ticket 同时只发一个 run：同票的后一项在本项结束前的每次 pump 里留在队首等空位，
-      // 否则新工作位会覆盖旧条目，stop 就再也 abort 不到先前的 run。
-      if (this.runs.has(work.ticketId)) return
-      this.waiting.shift()
+      // 只派发不被同票在飞挡住的工作：一个 ticket 同时只发一个 run，否则新工作位会覆盖旧条目，
+      // stop 就再也 abort 不到先前的 run；被挡住的项留在原位等 run 结束后的 pump。
+      const index = this.waiting.findIndex(work => !this.runs.has(work.ticketId))
+      if (index < 0) return
+      const work = this.waiting.splice(index, 1)[0]!
       const entry: RunEntry = { controller: new AbortController(), stopped: false }
       this.runs.set(work.ticketId, entry)
       const settled = this.dispatch(work, entry).finally(() => {
@@ -188,16 +188,17 @@ export class ZcodeExecutor implements Executor {
     const outcome = await run.done
     this.finish(work, entry, outcome)
   }
-  /** 以 --resume 续跑该 ticket 记录的 zcode 会话，文本是未投递 Inputs 的拼接；做不到时报告 blocked。 */
+  /** 以 --resume 续跑该 ticket 记录的 zcode 会话，文本是未投递 Inputs 的拼接；没有会话可续时报告 blocked。 */
   private async runDeliver(work: QueuedDeliver, entry: RunEntry): Promise<void> {
     const ticket = this.host.store.tickets.get(work.ticketId)
     if (!ticket || entry.stopped || !this.currentAssignment(ticket, work)) return
     const sessionId = this.sessions.get(work.ticketId)
-    // 这项工作自己占的工作位不算 in-flight：只看别的派发是否正在这个 ticket 上跑。
-    const holder = this.runs.get(work.ticketId)
-    const blocker = deliveryBlocker(holder !== undefined && holder !== entry, sessionId)
+    // pump 只在该票无在飞 run 时才会派发 deliver，所以这里能挡住的只有会话缺失。
+    const blocker = deliveryBlocker(sessionId)
     if (blocker) {
-      this.host.store.atomic(() => { this.host.engine.report(work.ticketId, { state: 'blocked', summary: blocker }) })
+      // 报告可能被 Engine 拒绝（票恰好结束）：无票可报，安静放弃。
+      try { this.host.store.atomic(() => { this.host.engine.report(work.ticketId, { state: 'blocked', summary: blocker }) }) }
+      catch { /* 票已结束：无票可报。 */ }
       return
     }
     const inputs = ticket.undelivered.map(id => ticket.inputs.find(input => input.id === id)).filter((input): input is TicketInput => !!input)
@@ -219,7 +220,8 @@ export class ZcodeExecutor implements Executor {
     const ticket = this.host.store.tickets.get(work.ticketId)
     if (!ticket || !liveTicket(ticket) || !this.reportableAssignment(ticket, work)) return
     if (outcome.sessionId) this.sessions.set(work.ticketId, outcome.sessionId)
-    const report = mapToWorkerReport({ parsed: parseResultBlock(outcome.resultText), exitCode: outcome.exitCode, timedOut: outcome.timedOut })
+    const report = mapToWorkerReport({ parsed: parseResultBlock(outcome.resultText), exitCode: outcome.exitCode, timedOut: outcome.timedOut,
+      stderrTail: outcome.stderrTail, outputTruncated: outcome.lossy })
     if (work.kind === 'start') {
       this.host.store.atomic(() => { this.host.engine.turnEnded(work.ticketId, work.assignmentId) })
       this.host.store.atomic(() => { this.host.engine.report(work.ticketId, report) })

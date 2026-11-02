@@ -84,6 +84,12 @@ it('reports failed when no RESULT block can be parsed', () => {
   expect(report.summary).toContain('RESULT')
 })
 
+it('attributes a missing block to output truncation when the run reported lossy stdout', () => {
+  const report = mapToWorkerReport({ parsed: null, exitCode: 0, timedOut: false, outputTruncated: true })
+  expect(report.state).toBe('failed')
+  expect(report.summary).toContain('被截断')
+})
+
 it('composes the report summary from the block without losing fields, omitting the ones without information', () => {
   const full = mapToWorkerReport({ parsed: parseResultBlock(block('ready', 'Shipped it', 'feat/x', 'abc1234', '#12', 'watch CI')), exitCode: 0, timedOut: false })
   expect(full.state).toBe('ready')

@@ -56,6 +56,8 @@ export interface WorkerOutcome {
   exitCode: number | null
   timedOut: boolean
   stderrTail?: string
+  /** stdout 曾滑出收集窗口：无块失败时要如实归因「可能被截掉」，不误导成 worker 违约。 */
+  outputTruncated?: boolean
 }
 /** 附加 stderr 末尾。为什么：失败结论往往藏在最后的输出里，summary 是人唯一会读的字段。 */
 const withTail = (summary: string, stderrTail?: string): string => {
@@ -78,13 +80,18 @@ const composeSummary = (parsed: ParsedResult): string => {
  * 其次退出码（非零或被杀都拿不到可信结论），然后才是块本身。
  * 铁律：只有 parsed.status === 'ready' 且 exitCode === 0 且未超时才产出 ready——任何路径都不猜 ready。
  */
-export function mapToWorkerReport({ parsed, exitCode, timedOut, stderrTail }: WorkerOutcome): WorkerReport {
+export function mapToWorkerReport({ parsed, exitCode, timedOut, stderrTail, outputTruncated }: WorkerOutcome): WorkerReport {
   if (timedOut) return { state: 'failed', summary: withTail('运行超时：worker 超过时限被终止，回复可能被截断，结果不可信。', stderrTail) }
   // exitCode 为 null 是被杀而非自行退出，与非零同属失败，只是措辞区分，便于人排查。
   if (exitCode === null) return { state: 'failed', summary: withTail('worker 进程被终止（无退出码），未得到可信的执行结果。', stderrTail) }
   if (exitCode !== 0) return { state: 'failed', summary: withTail(`worker 进程以退出码 ${exitCode} 失败。`, stderrTail) }
-  // 绿色退出后仍无块，才归因于回复违反了结尾约定。
-  if (!parsed) return { state: 'failed', summary: withTail('worker 已结束，但回复中没有可解析的 RESULT 块（缺失或不符合六行键序约定）。', stderrTail) }
+  // 绿色退出后仍无块，才归因于回复违反了结尾约定；输出被截断时改归因于截断。
+  if (!parsed) return {
+    state: 'failed',
+    summary: withTail(outputTruncated
+      ? 'worker 已结束，输出超过收集上限被截断，RESULT 块可能因此丢失。'
+      : 'worker 已结束，但回复中没有可解析的 RESULT 块（缺失或不符合六行键序约定）。', stderrTail),
+  }
   // 块的 status 只可能是三种终态之一，state 因此不会出现 ready 之外的猜测路径。
   const state: ReportState = parsed.status
   return { state, summary: composeSummary(parsed) }
