@@ -8,10 +8,12 @@ type ResultKey = (typeof KEYS)[number]
 /** 解析成功的一个 RESULT 块：`status` 限于三种终态，其余字段为逐字值，无信息时是字面 `none`。 */
 export interface ParsedResult { status: 'ready' | 'blocked' | 'failed'; summary: string; branch: string; head: string; pr: string; next: string }
 
-/** 发给 worker 的固定尾部指令。为什么固定：worker 的回复是唯一的回传通道，结尾约定必须逐字稳定，解析端才能机器可判。 */
-const BRIEF_TAIL = ['', '完成后，在回复的最后输出一个 RESULT 块：共六行，每行格式恰为 key: value（冒号加空格），键的顺序必须是：',
+/** 发给 worker 的固定尾部指令。为什么固定：worker 的回复是唯一的回传通道，结尾约定必须逐字稳定，解析端才能机器可判。
+ * 头行必须点名：真机首跑发现模型会省略字面 RESULT 头而只给普通围栏，严格解析器按设计拒绝——指令必须把头行钉死。 */
+const BRIEF_TAIL = ['', '完成后，在回复的最后输出一个 RESULT 块。块的第一行必须恰为字面 RESULT（整行只有这一个词；若用围栏，开头写成 ```RESULT）：',
+  '随后共六行，每行格式恰为 key: value（冒号加空格），键的顺序必须是：',
   'status: 只能是 ready、blocked、failed 之一', 'summary: 一句话结果', 'branch: 分支名', 'head: 最新提交的提交号', 'pr: PR 编号或链接',
-  'next: 建议的下一步', '没有对应信息时该行的值写 none；块可以用一对 ``` 围栏包裹。'].join('\n')
+  'next: 建议的下一步', '没有对应信息时该行的值写 none；RESULT 头行与六个键一行都不可省略。'].join('\n')
 
 /** 构造发给 ZCode `-p` 的全文：assignment 原文在前（不得改写），尾接固定的 RESULT 块指令。 */
 export function buildWorkerBrief(assignment: string): string {

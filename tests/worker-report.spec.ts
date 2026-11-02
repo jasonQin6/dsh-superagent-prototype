@@ -43,6 +43,8 @@ it('builds the worker brief from the assignment verbatim plus a six-key RESULT i
   const brief = buildWorkerBrief('Fix the bug.\nStep one: reproduce.')
   expect(brief.startsWith('Fix the bug.\nStep one: reproduce.')).toBe(true)
   expect(brief).toContain('RESULT')
+  // 头行指令必须点名：真机会省略字面 RESULT 头，严格解析器就只认头行起的块。
+  expect(brief).toContain('第一行必须恰为字面 RESULT')
   for (const key of ['status', 'summary', 'branch', 'head', 'pr', 'next']) expect(brief).toContain(`${key}:`)
   expect(brief).toContain('ready')
 })

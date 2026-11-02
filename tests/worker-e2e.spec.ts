@@ -1,6 +1,7 @@
 /**
  * ZcodeExecutor 的端口级端到端测试：跑真实 zcode 进程（默认 ~/.local/bin/zcode-wrapper），但不跑 Engine/Runtime。
- * 用 ZCODE_E2E 守卫（`ZCODE_E2E=1 env -i HOME="$HOME" PATH="$PATH" pnpm vitest run tests/worker-e2e.spec.ts`）：
+ * 用 ZCODE_E2E 守卫（注意变量必须放在 env -i 之后，前置赋值会被 env -i 清掉：
+ * `env -i HOME="$HOME" PATH="$PATH" ZCODE_E2E=1 pnpm vitest run tests/worker-e2e.spec.ts`）：
  * 默认全量测试不跑真进程；真跑一次 zcode 要几十秒到几分钟，所以单个 it 显式设了远大于默认值的 timeout。
  */
 import { execFile, spawn } from 'node:child_process'
@@ -20,9 +21,9 @@ import { SettingsSchema, type Settings } from '../src/policy.ts'
 const RUN_TIMEOUT_MS = 600_000
 /** it 的显式 timeout：必须盖过 run 上限，超时的 run 由执行器先报 failed，测试才能给出可读失败而不是 vitest 掐死。 */
 const E2E_TIMEOUT_MS = RUN_TIMEOUT_MS + 60_000
-/** 给 worker 的任务：小而确定，真机 zcode 在 yolo 模式下应能一次完成并按约定收尾。 */
-const ASSIGNMENT = ['在当前工作目录创建文件 notes.md，写入一行 "worker was here"，git add 并 commit（不要 push），然后按末尾指令输出 RESULT 块。',
-  'RESULT 块的第一行必须恰为字面 RESULT（若用围栏，写成 ```RESULT 开头），随后依次是六行 key: value；不要省略 RESULT 这一行。'].join('\n')
+/** 给 worker 的任务：小而确定，真机 zcode 在 yolo 模式下应能一次完成并按约定收尾。
+ * 故意不在这里复述 RESULT 块格式：块约定只来自 buildWorkerBrief 的固定尾部指令，E2E 要证明的就是生产 brief 单独足以让 worker 按约收尾。 */
+const ASSIGNMENT = '在当前工作目录创建文件 notes.md，写入一行 "worker was here"，git add 并 commit（不要 push）。'
 
 /** Promise 化地跑一条外部命令，失败时把 stderr 带进错误；测试文件可以用 child_process，git 设置与取证都走这里。 */
 const run = (file: string, args: readonly string[], cwd?: string): Promise<string> =>
