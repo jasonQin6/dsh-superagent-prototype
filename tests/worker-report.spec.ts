@@ -61,6 +61,11 @@ it('maps a parsed dropped result through on a clean exit', () => {
   expect(mapToWorkerReport({ parsed: parseResultBlock(block('dropped')), exitCode: 0, timedOut: false }).state).toBe('dropped')
 })
 
+it('tells the worker the working rules the DSH work prompt would carry', () => {
+  const brief = buildWorkerBrief(composeBriefBody({ title: 'T', request: 'R' }))
+  for (const piece of ['工作规则', 'AGENTS.md', '跑相关检查', 'force push', 'dropped']) expect(brief).toContain(piece)
+})
+
 it('tells the worker to push the branch and open a draft PR before reporting ready', () => {
   const brief = buildWorkerBrief(composeBriefBody({ title: 'T', request: 'R' }))
   expect(brief).toContain('push')

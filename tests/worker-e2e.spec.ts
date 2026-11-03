@@ -35,8 +35,9 @@ const run = (file: string, args: readonly string[], cwd?: string): Promise<strin
   })
 const wait = (ms: number): Promise<void> => new Promise(resolve => { setTimeout(resolve, ms) })
 
-/** 适配器里的一次真实 spawn：argv 留给测试区分 zcode run 与 prepare/verify 的 spawn，text 是收集到的 stdout 原文。 */
-interface RealSpawn { argv: readonly string[], text: string }
+/** 适配器里的一次真实 spawn：argv 留给测试区分 zcode run 与 prepare/verify 的 spawn，text 是收集到的 stdout 原文；
+ * 两个时间戳供并发用例证明两次 run 确实重叠，而不是排队跑完。 */
+interface RealSpawn { argv: readonly string[], text: string, spawnedAt: number, finishedAt?: number }
 
 /**
  * 最小真实 subprocess 适配器：node:child_process.spawn 实现 seam 协议（{ done, collected.stdout.readFrom(offset),
@@ -56,7 +57,7 @@ function realSubprocess() {
         env: { ...process.env, ...spec.env } as NodeJS.ProcessEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
-      const entry: RealSpawn = { argv: spec.argv, text: '' }
+      const entry: RealSpawn = { argv: spec.argv, text: '', spawnedAt: Date.now() }
       spawns.push(entry)
       let stderr = ''
       child.stdout!.on('data', chunk => { entry.text += chunk })
@@ -70,7 +71,7 @@ function realSubprocess() {
       spec.signal?.addEventListener('abort', terminate, { once: true })
       const done = new Promise<{ exitCode: number | null, signal: NodeJS.Signals | null }>((resolve, reject) => {
         child.on('error', reject)
-        child.on('close', (exitCode, signal) => resolve({ exitCode, signal: signal ?? null }))
+        child.on('close', (exitCode, signal) => { entry.finishedAt = Date.now(); resolve({ exitCode, signal: signal ?? null }) })
       })
       return {
         done, terminate,
@@ -90,17 +91,18 @@ interface Recorded { call: string, args: unknown[] }
 const variable = (key: string, value: string): { key: string, value: string } => ({ key, value })
 
 describe.skipIf(!process.env.ZCODE_E2E)('ZcodeExecutor end-to-end（真实 zcode 进程）', () => {
-  /** 临时根目录：临时主仓与其 worktree 都在里面，afterAll 整体删除。 */
-  let root: string | undefined
+  /** 每个用例的临时根目录：临时主仓与其 worktree 都在里面，afterAll 整体删除。 */
+  const roots: string[] = []
+  const tempRoot = async (): Promise<string> => { const dir = await mkdtemp(join(tmpdir(), 'zcode-e2e-')); roots.push(dir); return dir }
 
   afterAll(async () => {
     // 主仓连同它名下的 worktree 目录一起删；删不掉（如平台锁）时安静放弃，不遮蔽测试结论。
-    if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined)
+    for (const dir of roots) await rm(dir, { recursive: true, force: true }).catch(() => undefined)
   })
 
   it('start 备好 worktree，跑真 zcode，按序回写并产出 ready 报告', { timeout: E2E_TIMEOUT_MS }, async () => {
     // 临时主仓：mkdtemp + git init + 本仓级 user.email/user.name，不依赖操作员的全局 git 配置。
-    root = await mkdtemp(join(tmpdir(), 'zcode-e2e-'))
+    const root = await tempRoot()
     const mainRepo = join(root, 'repo')
     await run('git', ['init', mainRepo])
     await run('git', ['-C', mainRepo, 'config', 'user.email', 'e2e@example.invalid'])
@@ -190,6 +192,87 @@ describe.skipIf(!process.env.ZCODE_E2E)('ZcodeExecutor end-to-end（真实 zcode
     // 没有留下未提交的改动（worker 应把 notes.md 一起 commit）。
     const status = await run('git', ['-C', worktree, 'status', '--porcelain'])
     expect(status.trim(), `worktree 应是干净的:\n${status}`).toBe('')
+
+    executor.dispose()
+  })
+
+  it('runs two tickets at once against the real binary (maxWorkers: 2)', { timeout: E2E_TIMEOUT_MS }, async () => {
+    // 并发验证：两个独立的 zcode 进程同时跑，各自在自己的 worktree 里提交。ZCode 共享 ~/.zcode 的会话库，
+    // 这里要证明的是它们不互相踩（进程级隔离），而不是吞吐。
+    const root = await tempRoot()
+    const mainRepo = join(root, 'repo')
+    await run('git', ['init', mainRepo])
+    await run('git', ['-C', mainRepo, 'config', 'user.email', 'e2e@example.invalid'])
+    await run('git', ['-C', mainRepo, 'config', 'user.name', 'zcode e2e'])
+    await writeFile(join(mainRepo, 'README.md'), 'seed\n')
+    await run('git', ['-C', mainRepo, 'add', 'README.md'])
+    await run('git', ['-C', mainRepo, 'commit', '-m', 'seed'])
+
+    const settings: Settings = SettingsSchema.parse({ executor: {
+      maxWorkers: 2,
+      prepare: `git -C ${mainRepo} worktree add "$DSH_SUPERAGENT_DIR" -b "agent/$DSH_SUPERAGENT_NAME"`,
+      zcode: { command: '~/.local/bin/zcode-wrapper', timeoutMs: RUN_TIMEOUT_MS },
+    } })
+    /** 每个工单一个独立文件与一条独立 worktree；任务同样只走 origin trigger（产品路径）。 */
+    const task = (file: string): string => `在当前工作目录创建文件 ${file}，写入一行 "${file} was here"，git add 并 commit。`
+      + '这个临时仓库没有远端：不要 push，也不要开 PR。'
+    const ticketFor = (id: string, file: string): Ticket => ({
+      id, title: `ticket ${id}`, decisionId: `d-${id}`,
+      mandate: { strength: 'explicit', policyVersion: 'test', basis: { via: 'addressed', addressed: 'direct' }, actor: { source: 'test', id: 'op' }, scope: 'test' },
+      channels: [], assignments: [{ id: `a-${id}`, state: 'pending', createdAt: '2026-01-01T00:00:00Z' } as Assignment],
+      inputs: [], undelivered: [], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
+      origin: { triggerId: `t-${id}`, triggerIds: [`t-${id}`] },
+      execution: { name: id, directory: join(root, 'work', id), assignment: '' },
+    })
+    const tickets = [ticketFor('c1', 'one.md'), ticketFor('c2', 'two.md')]
+    const triggers: Record<string, Trigger> = Object.fromEntries(tickets.map((ticket, index) => [ticket.origin.triggerId,
+      { id: ticket.origin.triggerId, text: task(index === 0 ? 'one.md' : 'two.md'), actor: { source: 'test', id: 'jason' } } as unknown as Trigger]))
+
+    const log: Recorded[] = []
+    const record = (call: string) => (...args: unknown[]) => { log.push({ call, args }) }
+    const fake = realSubprocess()
+    const host = {
+      context: { subprocess: fake.runtime },
+      engine: {
+        assignmentStarted: record('assignmentStarted'), inputsDelivered: record('inputsDelivered'),
+        inputsRead: record('inputsRead'), turnEnded: record('turnEnded'), report: record('report'),
+      },
+      store: {
+        settings: () => settings,
+        atomic: (work: () => unknown) => work(),
+        tickets: { get: (id: string) => tickets.find(ticket => ticket.id === id) },
+        triggers: { get: (id: string) => triggers[id] },
+      },
+      machine: { stateDir: join(root, 'state') },
+      lifetime: new AbortController().signal,
+      paused: () => false,
+      environment: (ticket: Ticket) => [variable('DSH_SUPERAGENT_DIR', ticket.execution?.directory ?? ''),
+        variable('DSH_SUPERAGENT_NAME', ticket.execution?.name ?? '')],
+    } as unknown as ZcodeHost
+
+    const executor = new ZcodeExecutor(host)
+    for (const ticket of tickets) executor.start(ticket, ticket.assignments[0]!)
+    for (let rounds = 0; rounds < E2E_TIMEOUT_MS / 250 && log.filter(entry => entry.call === 'report').length < 2; rounds++) await wait(250)
+
+    const reports = log.filter(entry => entry.call === 'report')
+    const diagnostics = JSON.stringify(reports)
+    expect(reports.length, `两个工单都应回写报告: ${diagnostics}`).toBe(2)
+    for (const report of reports) expect((report.args[1] as { state: string }).state, diagnostics).toBe('ready')
+
+    // 各自的 worktree 里留下各自的 commit，互不串味。
+    for (const [id, file] of [['c1', 'one.md'], ['c2', 'two.md']] as const) {
+      const directory = join(root, 'work', id)
+      const stat = await run('git', ['-C', directory, 'show', '--stat', 'HEAD'])
+      expect(stat, `${id} 的提交应包含 ${file}:\n${stat}`).toContain(file)
+      expect((await run('git', ['-C', directory, 'status', '--porcelain'])).trim(), `${id} 的 worktree 应是干净的`).toBe('')
+    }
+
+    // 并发不是排队：两个 run 的时间区间必须重叠。
+    const runs = fake.spawns.filter(spawn => spawn.argv[0]!.endsWith('zcode-wrapper'))
+    expect(runs.length, '应有两个真实的 zcode 进程').toBe(2)
+    const [first, second] = runs as [RealSpawn, RealSpawn]
+    expect(Math.min(first.finishedAt ?? 0, second.finishedAt ?? 0), '两个 run 的时间区间应重叠')
+      .toBeGreaterThan(Math.max(first.spawnedAt, second.spawnedAt))
 
     executor.dispose()
   })

@@ -75,8 +75,9 @@ explicitly set `kind: 'zcode'`. Decisions in ADR-0011 of
 - `tests/worker-backend.spec.ts`, `tests/worker-report.spec.ts`,
   `tests/worker-config.spec.ts`, `tests/worker-executor.spec.ts` — port-level
   tests on fakes
-- `tests/worker-e2e.spec.ts` — one real-process end-to-end on this machine,
-  guarded by `ZCODE_E2E` so the default suite skips it
+- `tests/worker-e2e.spec.ts` — real-process end-to-end on this machine (one
+  ticket, and two concurrent tickets under `maxWorkers: 2`), guarded by
+  `ZCODE_E2E` so the default suite skips it
 - `docs/010-worker.md` — enablement, execution model, uncovered semantics, and
   the E2E run method
 

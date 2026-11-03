@@ -19,6 +19,14 @@ const BRIEF_TAIL = ['', '完成后，在回复的最后输出一个 RESULT 块�
 
 /** 发给 worker 的固定开头：一次性进程没有 session 级提示词，工作区、提交与交付约定只能在这里说清。 */
 const BRIEF_INTRO = '你在下面这个工作目录里完成一张工单的请求。改动提交到当前分支；不要新建 worktree、不要切换分支、不要合并。'
+/** 工作规则：DSH worker 从 `prompts/work.md` 拿到这些，一次性进程没有会话级提示词，只能由 brief 承担这一份最小集。 */
+const BRIEF_RULES = ['工作规则：',
+  '- 只做请求范围内的事；需要产品决策、扩大公开接口或碰到凭据/配置，就停下报 blocked，不要自行扩张范围，也不要提问（没有人会回答）。',
+  '- 动手前先读仓库里的 AGENTS.md / CLAUDE.md（若有），遵守它的验证与提交约定，提交信息用仓库风格。',
+  '- 改动必须自己跑相关检查（测试 / typecheck / lint），把跑过什么写进 summary；没跑过就直说没跑。',
+  '- 不合并、不 force push、不删分支、不装依赖、不改与请求无关的代码。',
+  '- 做不完报 blocked 并写清剩余工作；没有可交付的改动或无事可做报 dropped。'].join('\n')
+
 /** 交付约定：与 DSH worker 一致，代码改动要 push 并开 draft PR，否则 ready 的票会以"本地提交"收尾、交付链断在本地。 */
 const BRIEF_DELIVERY = '交付：代码改动提交后把当前分支 push 到 origin，并用 gh 开一个 draft PR，把 PR 链接写进 RESULT 的 pr 字段；'
   + 'push 或开 PR 失败就报 blocked 并在 summary 里写清失败原因。不要合并、不要开 auto-merge。'
@@ -45,7 +53,7 @@ export interface WorkerBriefBody {
  * 而 ZCode 没有那条投递通道，请求正文只能由 brief 补上，否则 worker 收到的是一张没有任务的票。
  */
 export function composeBriefBody({ title, assignment, mandate, request, requestChars, requestRead }: WorkerBriefBody): string {
-  const parts = [BRIEF_INTRO, BRIEF_DELIVERY, `工单：${title}`]
+  const parts = [BRIEF_INTRO, BRIEF_RULES, BRIEF_DELIVERY, `工单：${title}`]
   const note = assignment?.trim()
   if (note) parts.push(`assignment：${note}`)
   if (mandate) parts.push(mandate)
