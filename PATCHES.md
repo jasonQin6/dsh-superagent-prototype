@@ -53,6 +53,40 @@ The shipped pin keeps the alpha.2 devDependencies, so the install and
 `pnpm check` are green; the HTTP surface is verified against the running rc.5
 host by the contract tests in `dsh-taskboard-ext`.
 
+## 3. `goal/worker-module` ZCode worker module (feature branch)
+
+The `goal/worker-module` branch adds a second executor behind the existing
+`Executor` port (`src/core/ports.ts`), off by default: `executor.kind`
+defaults to `dsh`, so stock deployments keep the `DshExecutor` unless they
+explicitly set `kind: 'zcode'`. Decisions in ADR-0011 of
+`jasonQin6/dsh-taskboard-ext`; usage in `docs/010-worker.md`. Files:
+
+- `src/executor/execution-shared.ts` — the execution contract the two
+  executors share (`ticketExecution`, `prepareDirectory`, `PrepareFailed`)
+- `src/executor/zcode.ts` — the `ZcodeExecutor` itself: in-memory queue under
+  `maxWorkers`, one zcode run per assignment (the brief carries the ticket's
+  origin request, capped with the full text written under `<stateDir>/worker-briefs`),
+  resume-or-`blocked` deliveries, stop aborts without reporting
+- `src/executor/zcode-backend.ts` — the process backend: the argv contract and
+  `runZcodeRun`, which reads one run as an NDJSON stream
+- `src/executor/zcode-report.ts` — the plain-text contract: `composeBriefBody`
+  (title + assignment + mandate + the origin request), `buildWorkerBrief`,
+  `parseResultBlock`, `mapToWorkerReport` (never guesses `ready`)
+- `tests/worker-backend.spec.ts`, `tests/worker-report.spec.ts`,
+  `tests/worker-config.spec.ts`, `tests/worker-executor.spec.ts` — port-level
+  tests on fakes
+- `tests/worker-e2e.spec.ts` — one real-process end-to-end on this machine,
+  guarded by `ZCODE_E2E` so the default suite skips it
+- `docs/010-worker.md` — enablement, execution model, uncovered semantics, and
+  the E2E run method
+
+This is a feature-branch patch record: it takes effect when the fork pin moves
+to a commit containing it (ADR-0007 pinning). Before moving the pin, run the
+real end-to-end once on the exact commit being pinned
+(`ZCODE_E2E=1 pnpm vitest run tests/worker-e2e.spec.ts`): it is the only check
+that a production brief makes ZCode read the ticket request and finish with a
+RESULT block.
+
 ### Environment note (not a source patch)
 
 Run `pnpm check` outside a dsh-superagent worker shell. The Executor exports

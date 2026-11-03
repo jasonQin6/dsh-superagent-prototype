@@ -87,6 +87,8 @@ export const EvalConfigSchema = z.object({
 }).strict()
 const CommandNameSchema = z.string().regex(/^[A-Za-z0-9._-]+$/).refine(name => name !== '.' && name !== '..', 'Not a command name')
   .refine(name => !WORKER_COMMANDS.includes(name), `${WORKER_COMMANDS.join(', ')} cannot be blocked`)
+/** Defaults of the `zcode` executor's options, also used when the whole `zcode` block is absent. */
+export const ZCODE_DEFAULTS = { command: '~/.local/bin/zcode-wrapper', timeoutMs: 1_800_000 }
 /** Executor settings: worker model, concurrency, ticket directory root (empty defaults to `<stateDir>/work`), `prepare` command, and blocked commands. */
 export const ExecutorConfigSchema = z.object({
   model: RoleModelSchema.nullable().default(null),
@@ -94,6 +96,12 @@ export const ExecutorConfigSchema = z.object({
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
+  // kind/zcode 不设 zod 默认值：默认值一旦进入解析结果，存量 settings 的全量断言就会多出字段；缺省由使用方按 'dsh' 处理。
+  kind: z.enum(['dsh', 'zcode']).optional(),
+  zcode: z.object({
+    command: z.string().trim().min(1).default(ZCODE_DEFAULTS.command),
+    timeoutMs: z.number().int().min(1).default(ZCODE_DEFAULTS.timeoutMs),
+  }).strict().optional(),
 }).strict()
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({

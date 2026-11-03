@@ -352,7 +352,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
+| `src/executor/execution-shared.ts` | The execution contract the executors share: `ticketExecution`, a Ticket's worktree name, workspace directory and assignment text, and `prepareDirectory` with `PrepareFailed` |
+| `src/executor/zcode.ts` | The `ZcodeExecutor` for `kind: 'zcode'`: it fills the shared execution contract, launches one zcode run per assignment through the process backend, and resumes a ticket's recorded zcode session with its undelivered Inputs, all through an in-memory queue under the `maxWorkers` limit; a delivery that cannot resume reports `blocked`, a failed launch reports `failed` without retries, and a stop aborts the run in flight and reports nothing |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
+| `src/executor/zcode-backend.ts` | The ZCode process backend over the subprocess seam: `buildZcodeArgv`, the argv contract of a first run and a resume, and `runZcodeRun`, which runs it as one NDJSON stream, keeps every line it does not consume verbatim, and reports the exit, whether the deadline stopped it, and the last `result` event's session id and response |
+| `src/executor/zcode-report.ts` | The plain-text contract with a ZCode worker: `buildWorkerBrief` appends the fixed six-key RESULT block instruction to an assignment, `parseResultBlock` reads the last block of a reply, and `mapToWorkerReport` maps the block with the process outcome to a `WorkerReport`, yielding `ready` only on a parsed ready with a clean exit |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
 | `src/infra/paths.ts` | The package's root, where packaged files are |
@@ -413,6 +417,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
+| `tests/worker-backend.spec.ts` | The ZCode process backend on a fake subprocess: the argv contract of a first run and a resume, the incremental NDJSON parsing that keeps unknown and broken lines verbatim, the last `result` extraction, and the deadline and stop paths |
+| `tests/worker-executor.spec.ts` | The `ZcodeExecutor` on a fake subprocess and a recording engine: the start path's callback order and its `failed` paths (a prepare failure without retry, a reply without a RESULT block, a deadline), the resume and `blocked` delivery paths, a stop that reports nothing afterwards, and the concurrency limit queuing the next start until a slot frees |
+| `tests/worker-e2e.spec.ts` | The `ZcodeExecutor` against a real zcode process on this machine, guarded by `ZCODE_E2E` and skipped by the default suite: a temporary git repository, a `git worktree` prepare, and one run whose worker commits `notes.md` and reports a ready RESULT block, with the callback order and the worktree's new commit asserted (see document 010 Worker) |
 | `tests/bundle-patch.spec.ts` | The bundle's patch, read as DeepSeek Harness reads it, and the agent preset of Executor Sessions it defines |
 | `tests/effects.spec.ts` | The effect queue: coalescing, limits, retries with backoff, health and shutdown |
 | `tests/passes.spec.ts` | Passes: one at a time, the ones asked for during a pass run as one after it, and the runtime health a failed pass reports |
@@ -426,6 +433,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/runtime.spec.ts` | The whole application on a simulated DeepSeek Harness host, through tools and HTTP |
 | `tests/tools.spec.ts` | The Sessions' tools: what `orchestrator_read` reads for each role, and the shapes and checks of the other main Session tools |
 | `tests/runtime-concurrency.spec.ts` | Work that overlaps: Triggers during a pass, Tickets that change during deliveries and launches |
+| `tests/worker-config.spec.ts` | Which executor the settings build: the DSH executor by default, the zcode executor for `kind: 'zcode'` with its option defaults, and the refusal of an unknown kind |
 | `tests/http.spec.ts` | The same-origin and loopback checks, the status of each kind of failure, the body limit, path parameters and queries |
 | `tests/settings.spec.ts` | Settings saves that race a model or account check, a Policy sync that a save outran, and the refusals of the pause, a sync and a block |
 | `tests/views.spec.ts` | What the management views derive from the Store, such as the Thread a dropped message belongs to |
@@ -443,6 +451,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/draft.spec.ts`, `tests/prompt-config.spec.ts`, `tests/markdown.spec.ts`, `tests/marks.spec.ts` | Draft states, merges and the save bar's line; the prompt configuration by section and the line diff; the Markdown subset and its links; the mark of every state the views classify |
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
+| `tests/worker-report.spec.ts` | The RESULT block contract: the worker brief construction, parsing the last block of a reply, and the mapping to `WorkerReport`, which reports `ready` only when the block said so on a clean, untimed-out exit |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
 
 `tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
