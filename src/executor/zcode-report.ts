@@ -15,9 +15,43 @@ const BRIEF_TAIL = ['', '完成后，在回复的最后输出一个 RESULT 块�
   'status: 只能是 ready、blocked、failed 之一', 'summary: 一句话结果', 'branch: 分支名', 'head: 最新提交的提交号', 'pr: PR 编号或链接',
   'next: 建议的下一步', '没有对应信息时该行的值写 none；RESULT 头行与六个键一行都不可省略。'].join('\n')
 
-/** 构造发给 ZCode `-p` 的全文：assignment 原文在前（不得改写），尾接固定的 RESULT 块指令。 */
-export function buildWorkerBrief(assignment: string): string {
-  return `${assignment}${BRIEF_TAIL}`
+/** 发给 worker 的固定开头：一次性进程没有 session 级提示词，工作区与提交约定只能在这里说清。 */
+const BRIEF_INTRO = '你在下面这个工作目录里完成一张工单的请求。改动提交到当前分支；不要新建 worktree、不要切换分支、不要合并。'
+
+/** composeBriefBody 的输入：票面、assignment、授权说明与原始请求；请求被截断时再带上总数与全文位置。 */
+export interface WorkerBriefBody {
+  /** The ticket's title. */
+  title: string
+  /** The ticket's assignment text: a routing note, or the scope of a proactively accepted ticket; omitted when empty. */
+  assignment?: string
+  /** Instructions the ticket's mandate adds beyond the request, such as the narrower authority of an inferred ticket. */
+  mandate?: string
+  /** The origin request's text, already capped by the caller. */
+  request: string
+  /** Total characters of the request before capping; present only when the caller capped it. */
+  requestChars?: number
+  /** Absolute path of the full request, present only when it was capped and written out. */
+  requestRead?: string
+}
+
+/**
+ * 组装交给 ZCode 的任务正文：票面、assignment、授权说明、原始请求。
+ * 为什么请求必须在这里：`ticket.execution.assignment` 只带路由注记——原型由 launch 单独投递 origin trigger，
+ * 而 ZCode 没有那条投递通道，请求正文只能由 brief 补上，否则 worker 收到的是一张没有任务的票。
+ */
+export function composeBriefBody({ title, assignment, mandate, request, requestChars, requestRead }: WorkerBriefBody): string {
+  const parts = [BRIEF_INTRO, `工单：${title}`]
+  const note = assignment?.trim()
+  if (note) parts.push(`assignment：${note}`)
+  if (mandate) parts.push(mandate)
+  parts.push(`请求：\n${request}`)
+  // 截断时给出总数与全文位置：worker 能去读完整正文，不会把"开头部分"当成全部。
+  if (requestChars !== undefined) parts.push(`（请求正文共 ${requestChars} 字，以上为开头部分${requestRead ? `；完整正文见 ${requestRead}` : ''}。）`)
+  return parts.join('\n\n')
+}
+/** 构造发给 ZCode `-p` 的全文：正文在前（不得改写），尾接固定的 RESULT 块指令。 */
+export function buildWorkerBrief(body: string): string {
+  return `${body}${BRIEF_TAIL}`
 }
 /** 块头判定：整行去空白后恰为三种形态之一，`RESULT` 出现在行中间不算是新块。 */
 const isHeader = (line: string): boolean => {

@@ -1,8 +1,8 @@
-/** The execution contract shared by executors: a ticket's execution metadata (worktree name, workspace directory, assignment text) and its workspace directory preparation. */
+/** The execution contract shared by executors: a ticket's execution metadata (worktree name, workspace directory, assignment text), its workspace directory preparation, and the mandate instructions a worker is told beyond the request. */
 import type { Context } from '@deepseek-ai/cordis'
 import { mkdir, rmdir } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import type { AssessmentOutcome, Execution, Ticket } from '../core/index.ts'
+import type { AssessmentOutcome, Execution, Mandate, Ticket } from '../core/index.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
 import type { Settings } from '../policy.ts'
 import type { Store } from '../app/store.ts'
@@ -64,4 +64,13 @@ export async function prepareDirectory(host: PrepareHost, ticket: Ticket): Promi
     })
   await mkdir(directory, { recursive: true })
   await verifyDirectory(directory, host.context.subprocess, host.lifetime)
+}
+/**
+ * Returns additional instruction for a worker beyond the request: for work accepted proactively under rules
+ * (`strength === 'inferred'`), restricts authorization to small internal changes within the rule scope; returns `''` for explicit requests.
+ */
+export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string {
+  return mandate.strength === 'inferred' ? 'This ticket has limited proactive authorization. Independently verify that it is a small change '
+    + 'internal to one module within the accepted rule scope. If it requires public-interface or behavior changes, new interaction, product '
+    + 'decisions or clarification, stop and report dropped; do not expand scope.' : ''
 }

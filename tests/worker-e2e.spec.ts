@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import type { Assignment, Ticket } from '../src/core/index.ts'
+import type { Assignment, Ticket, Trigger } from '../src/core/index.ts'
 import type { ZcodeHost } from '../src/executor/zcode.ts'
 import { ZcodeExecutor } from '../src/executor/zcode.ts'
 import { parseResultBlock } from '../src/executor/zcode-report.ts'
@@ -125,8 +125,10 @@ describe.skipIf(!process.env.ZCODE_E2E)('ZcodeExecutor end-to-end（真实 zcode
       channels: [], assignments: [{ id: 'a-e2e', state: 'pending', createdAt: '2026-01-01T00:00:00Z' } as Assignment],
       inputs: [], undelivered: [], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z',
       origin: { triggerId: 't-e2e', triggerIds: ['t-e2e'] },
-      execution: { name: 'e2e-worker', directory: worktree, assignment: ASSIGNMENT },
+      // 产品路径：explicit 票的 assignment 为空，任务正文只在 origin trigger 上；brief 必须把它带进提示词。
+      execution: { name: 'e2e-worker', directory: worktree, assignment: '' },
     }
+    const origin = { id: 't-e2e', text: ASSIGNMENT, actor: { source: 'test', id: 'jason' } } as unknown as Trigger
     const log: Recorded[] = []
     const record = (call: string) => (...args: unknown[]) => { log.push({ call, args }) }
     const fake = realSubprocess()
@@ -140,7 +142,7 @@ describe.skipIf(!process.env.ZCODE_E2E)('ZcodeExecutor end-to-end（真实 zcode
         settings: () => settings,
         atomic: (work: () => unknown) => work(),
         tickets: { get: (id: string) => id === t.id ? t : undefined },
-        triggers: { get: () => undefined },
+        triggers: { get: (id: string) => id === origin.id ? origin : undefined },
       },
       machine: { stateDir: join(root, 'state') },
       lifetime: new AbortController().signal,

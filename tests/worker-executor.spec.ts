@@ -3,12 +3,13 @@
  * Engine 用录音 fake，不跑真实 zcode。锁定 start 的回调序与失败路、deliver 的续跑与 blocked 两路、stop 不再 report，
  * 以及全局并发上限（第 maxWorkers+1 个 start 排队，空位后开跑）。
  */
+import { readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import type { Mock } from 'vitest'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import type { Assignment, Ticket } from '../src/core/index.ts'
+import type { Assignment, Ticket, Trigger } from '../src/core/index.ts'
 import { SettingsSchema, type Settings } from '../src/policy.ts'
 import { ZcodeExecutor, type ZcodeHost } from '../src/executor/zcode.ts'
 
@@ -37,6 +38,8 @@ const ticket = (id: string, assignment: Partial<Assignment> = {}, extra: Partial
   execution: { name: `n-${id}`, directory: join(tmpdir(), 'zcode-executor-spec', id), assignment: 'do the thing' },
   ...extra,
 })
+/** 一条最小 Trigger：requestText 只读 actor.id 与 text，其余字段与这些测试无关。 */
+const trigger = (id: string, text: string): Trigger => ({ id, text, actor: { source: 'test', id: 'jason' } }) as unknown as Trigger
 /** fake subprocess 里的一次 spawn：spec 可断言，输出与退出由测试用 write/settle 手动驱动。 */
 interface FakeSpec {
   argv: readonly string[]
@@ -75,14 +78,14 @@ function fakeSubprocess() {
 interface Recorded { call: string, args: unknown[] }
 
 /** 一套端口级 harness：fake subprocess + 录音 engine + 手工 store，装配出被测的 ZcodeExecutor。 */
-function harness(options: { settings?: Settings, tickets?: Ticket[], lifetime?: AbortSignal, stateful?: boolean } = {}) {
+function harness(options: { settings?: Settings, tickets?: Ticket[], triggers?: Record<string, Trigger>, lifetime?: AbortSignal, stateful?: boolean } = {}) {
   const log: Recorded[] = []
   const record = (call: string) => (...args: unknown[]) => { log.push({ call, args }) }
   const store = {
     settings: () => options.settings ?? settings(),
     atomic: (work: () => unknown) => work(),
     tickets: { get: (id: string) => options.tickets?.find(ticket => ticket.id === id) },
-    triggers: { get: () => undefined },
+    triggers: { get: (id: string) => options.triggers?.[id] },
   }
   const engine = {
     assignmentStarted: record('assignmentStarted'),
@@ -131,6 +134,46 @@ describe('ZcodeExecutor.start', () => {
     await eventually(() => log.length >= 3)
     expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report'])
     expect(log[2]!.args).toEqual([t.id, { state: 'ready', summary: 'summary: it is done\nbranch: wt-main\nhead: abc1234' }])
+  })
+  it('puts the ticket title and origin request into the brief even when the assignment is empty', async () => {
+    // 产品路径：explicit 票的 execution.assignment 只有路由注记（通常为空），请求正文在 origin trigger 上。
+    const t = ticket('t1', {}, {
+      title: 'Parser crashes on submit',
+      execution: { name: 'n-t1', directory: join(tmpdir(), 'zcode-executor-spec', 't1'), assignment: '' },
+    })
+    const { executor, fake } = harness({ tickets: [t], triggers: { 't-t1': trigger('t-t1', 'The login page crashes when I submit the form.') } })
+    executor.start(t, t.assignments[0]!)
+    await eventually(() => fake.spawns.length === 1)
+    fake.spawns[0]!.settle({ exitCode: 1, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 1)
+    const argv = zcodeRuns(fake)[0]!.spec.argv
+    const brief = argv[argv.indexOf('-p') + 1]!
+    expect(brief).toContain('Parser crashes on submit')
+    expect(brief).toContain('The login page crashes when I submit the form.')
+    expect(brief).toContain('RESULT')
+    const run = zcodeRuns(fake)[0]!
+    run.write(`${resultLine('sess_1', readyText)}\n`)
+    run.settle({ exitCode: 0, signal: null })
+  })
+  it('caps a long origin request and writes the full text where the worker can read it', async () => {
+    const long = `request-head ${'x'.repeat(7_000)} request-tail`
+    const t = ticket('t1', {}, { execution: { name: 'n-t1', directory: join(tmpdir(), 'zcode-executor-spec', 't1'), assignment: '' } })
+    const { executor, fake } = harness({ tickets: [t], triggers: { 't-t1': trigger('t-t1', long) } })
+    executor.start(t, t.assignments[0]!)
+    await eventually(() => fake.spawns.length === 1)
+    fake.spawns[0]!.settle({ exitCode: 1, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 1)
+    const argv = zcodeRuns(fake)[0]!.spec.argv
+    const brief = argv[argv.indexOf('-p') + 1]!
+    // requestText 会带上的作者前缀也算进正文长度。
+    expect(brief).toContain(`请求正文共 ${`jason: ${long}`.length} 字`)
+    const read = /完整正文见 (\S+?)。/.exec(brief)?.[1]
+    expect(read).toBeTruthy()
+    // 全文落盘：worker 能读到被截掉的那一段，不会把开头当成全部。
+    expect(await readFile(read!, 'utf8')).toContain('request-tail')
+    const run = zcodeRuns(fake)[0]!
+    run.write(`${resultLine('sess_1', readyText)}\n`)
+    run.settle({ exitCode: 0, signal: null })
   })
   it('reports through a stateful engine that has flipped the assignment to running (regression)', async () => {
     const t = ticket('t1')
@@ -234,10 +277,10 @@ describe('ZcodeExecutor.deliver', () => {
     expect(log.some(entry => entry.call === 'inputsDelivered' && JSON.stringify(entry.args[2]) === '["i1"]')).toBe(true)
     resume.write(`${resultLine('sess_1', readyText)}\n`)
     resume.settle({ exitCode: 0, signal: null })
-    await eventually(() => log.length >= 6)
-    expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report', 'inputsDelivered', 'inputsRead', 'report'])
-    expect(log[4]!.args).toEqual([t.id, ['i1']])
-    expect(log[5]!.args[1]).toMatchObject({ state: 'ready' })
+    await eventually(() => log.length >= 7)
+    expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report', 'inputsDelivered', 'turnEnded', 'inputsRead', 'report'])
+    expect(log[5]!.args).toEqual([t.id, ['i1']])
+    expect(log[6]!.args[1]).toMatchObject({ state: 'ready' })
   })
   it('reports blocked with the reason in the summary when no session exists to resume', async () => {
     const t = ticket('t1', { state: 'running' }, { undelivered: ['i1'], inputs: [{ id: 'i1', kind: 'text', text: 'also do X', at: '2026-01-01T01:00:00Z' }] })
@@ -276,8 +319,8 @@ describe('ZcodeExecutor.deliver', () => {
     expect(resume.spec.argv[resume.spec.argv.indexOf('-p') + 1]).toContain('also do X')
     resume.write(`${resultLine('sess_1', readyText)}\n`)
     resume.settle({ exitCode: 0, signal: null })
-    await eventually(() => log.some(entry => entry.call === 'inputsRead'))
-    expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report', 'inputsDelivered', 'inputsRead', 'report'])
+    await eventually(() => log.length >= 7)
+    expect(log.map(entry => entry.call)).toEqual(['assignmentStarted', 'turnEnded', 'report', 'inputsDelivered', 'turnEnded', 'inputsRead', 'report'])
   })
   it('dispatches another ticket\'s start while a same-ticket delivery waits behind its own run', async () => {
     const t1 = ticket('t1'), t2 = ticket('t2')

@@ -30,8 +30,9 @@
 
 - **一次性进程，非长驻会话**。每张票的每个 Assignment 触发一次独立的 zcode run：`start` → `prepareDirectory`（复用原型 prepare 机制）→ `assignmentStarted` → run → `turnEnded` → `report`。首发建会话（`-p <brief> --cwd <worktree> --mode yolo --disallowed-tools AskUserQuestion EnterPlanMode ExitPlanMode --output-format stream-json --no-color`），续跑用 `--resume <sessionId>`。子进程一律走 `ctx.subprocess`，不裸 `child_process`。
 - **NDJSON result 行**。stdout 按行增量 `JSON.parse`；只消费最后一行 `type:"result"` 的 `sessionId` 与 `response`（驼峰字段），其余行（未知事件、hook 噪声、坏行）按原文保留，不按事件数判成功。增量读取是 offset 制的，done 之后还有一次收尾读兜底排干管道。
-- **RESULT 协议**。`buildWorkerBrief` 把 assignment 原文原样置前，尾接固定的六行 RESULT 块指令（`status`/`summary`/`branch`/`head`/`pr`/`next`，顺序恰定）。取回复中最后一个块解析；判定顺序即可信度顺序：超时最先、退出码次之、然后才是块本身——退出码非 0、超时、解析不出都报 `failed`，只有 `status: ready` 且干净退出才产出 `ready`，任何路径不猜 ready。
-- **deliver = `--resume`，在飞则排队等结算**。未投递 Inputs 到来时，若该票记录了 zcode 会话且没有 run in flight，则以 `--resume` 续跑，文本是未投递 Inputs 的拼接，投递后 run 结束时同事务记 `inputsRead` 与 report；run 在飞时到达的 deliver 留在队列里，等该 run 结束后由派发循环续跑（首发 brief 只带 assignment 文本，发射前后到达的输入必须经续跑送达）；没有会话可续（如重启后）才 `report blocked` 写明原因，不报 `deliveryFailed`、不重试。已知边界：首发 run 以 `ready` 终结票时，还在等的 deliver 随票作废——一次性 run 模型下输入不并入已完成的结论。
+- **brief 的内容**。`composeBriefBody` 组装正文：固定开头（在工作目录内工作、提交到当前分支、不新建 worktree/不切分支/不合并）、工单标题、`assignment`（路由注记或推断票的范围）、mandate 指令、**origin trigger 正文**，再由 `buildWorkerBrief` 尾接 RESULT 指令。请求正文必须由 brief 补上：`ticket.execution.assignment` 只带路由注记（原型由 launch 单独投递 trigger），ZCode 没有这条投递通道。请求超过 6000 字时截断，全文写到 `<stateDir>/worker-briefs/<ticket id>.md` 并在 brief 里给出路径——`-p` 走 argv，长 issue 正文不能整段塞进去。续跑 brief 只含未投递 Inputs 的拼接，上下文由 `--resume` 的会话带着。
+- **RESULT 协议**。`buildWorkerBrief` 把正文原样置前，尾接固定的六行 RESULT 块指令（`status`/`summary`/`branch`/`head`/`pr`/`next`，顺序恰定）。取回复中最后一个块解析；判定顺序即可信度顺序：超时最先、退出码次之、然后才是块本身——退出码非 0、超时、解析不出都报 `failed`，只有 `status: ready` 且干净退出才产出 `ready`，任何路径不猜 ready。
+- **deliver = `--resume`，在飞则排队等结算**。未投递 Inputs 到来时，若该票记录了 zcode 会话且没有 run in flight，则以 `--resume` 续跑，文本是未投递 Inputs 的拼接，投递后 run 结束时先记 `turnEnded`（与首发一致，`assignment.idleAt` 与面板时长用它），再同事务记 `inputsRead` 与 report；run 在飞时到达的 deliver 留在队列里，等该 run 结束后由派发循环续跑（首发 brief 只带 origin 请求，发射前后到达的输入必须经续跑送达）；没有会话可续（如重启后）才 `report blocked` 写明原因，不报 `deliveryFailed`、不重试。已知边界：首发 run 以 `ready` 终结票时，还在等的 deliver 随票作废——一次性 run 模型下输入不并入已完成的结论。
 - **stop = abort**。run 的生命周期信号 = 宿主 lifetime + 本 run 的 controller + 超时 deadline 的合成；`stop`/`shutdown`/宿主停止都收得走它，由 subprocess 适配层终止进程树。stop 之后不再为该票 report；宿主 lifetime 中止后排队的待派发工作直接丢弃，不派发也不报告。
 - **并发 = `maxWorkers`，每票单飞**。一个内存 FIFO 在 `maxWorkers` 个工作位下派发；同一张票同时至多一个 in-flight run，被同票在飞挡住的队列项原地等待，不挡其他票的派发。prepare 失败不重试（半成品目录不得当成已准备好），直接 `failed`。
 
@@ -44,10 +45,11 @@
 - resume 不跨重启：会话 id 只在内存，重启后 `deliver` 会报 `blocked`（无可续跑会话）；重启的中断恢复语义 ADR-0011 尚未覆盖。
 - `inputsRead` 只能在续跑 run 完成后近似上报，无法观察「Session 取入 step」。
 - 每机器 HealthBoard 条目与多机路由（docs/009 阶段 B 之后的事）；health 条目仍归 `DshExecutor`。
+- DSH worker 的工作规则提示词（`prompts/work.md` 的交付、PR、合并与线程处理规则）未移植：zcode brief 只含任务正文、提交约定与 RESULT 协议，不包含 `orchestrator_*` 工具面。
 
 ## 端到端验证（E2E）
 
-`tests/worker-e2e.spec.ts` 在真机上跑一次端口级端到端：临时 git 主仓（仓级 `user.email`/`user.name`）+ `git worktree` prepare + 真实 zcode 进程，断言回调序（`assignmentStarted → turnEnded → report`）、`ready` 报告、RESULT 块原文，以及 worktree 里 worker 的新 commit 含 `notes.md`；它不跑整个 Engine/Runtime。该测试被 `ZCODE_E2E` 环境变量守卫，默认全量测试不跑真进程（真跑一次要几十秒到几分钟，单个用例显式设了 timeout）：
+`tests/worker-e2e.spec.ts` 在真机上跑一次端口级端到端：临时 git 主仓（仓级 `user.email`/`user.name`）+ `git worktree` prepare + 真实 zcode 进程，断言回调序（`assignmentStarted → turnEnded → report`）、`ready` 报告、RESULT 块原文，以及 worktree 里 worker 的新 commit 含 `notes.md`；它不跑整个 Engine/Runtime。任务是产品路径的：`execution.assignment` 为空，任务正文只在 origin trigger 上，因此这条用例同时证明 brief 把请求带进了提示词。该测试被 `ZCODE_E2E` 环境变量守卫，默认全量测试不跑真进程（真跑一次要几十秒到几分钟，单个用例显式设了 timeout）：
 
 ```sh
 env -i HOME="$HOME" PATH="$PATH" ZCODE_E2E=1 pnpm vitest run tests/worker-e2e.spec.ts

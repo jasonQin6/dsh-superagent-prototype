@@ -1,6 +1,9 @@
 /** RESULT 块解析、WorkerReport 映射与 worker brief 构造：worker 回复是唯一回传通道，其约定必须机器可判。 */
 import { expect, it } from 'vitest'
-import { buildWorkerBrief, mapToWorkerReport, parseResultBlock } from '../src/executor/zcode-report.ts'
+import type { Ticket } from '../src/core/index.ts'
+import { ticketExecution } from '../src/executor/execution-shared.ts'
+import { buildWorkerBrief, composeBriefBody, mapToWorkerReport, parseResultBlock } from '../src/executor/zcode-report.ts'
+import { SettingsSchema } from '../src/policy.ts'
 
 const block = (status = 'ready', summary = 'Shipped it', branch = 'feat/x', head = 'abc1234', pr = '#12', next = 'none'): string =>
   `RESULT\nstatus: ${status}\nsummary: ${summary}\nbranch: ${branch}\nhead: ${head}\npr: ${pr}\nnext: ${next}`
@@ -97,4 +100,35 @@ it('composes the report summary from the block without losing fields, omitting t
   const sparse = mapToWorkerReport({ parsed: parseResultBlock(block('ready', 'Shipped it')), exitCode: 0, timedOut: false })
   expect(sparse.summary).toContain('Shipped it')
   expect(sparse.summary).not.toContain('none')
+})
+
+it('composes the brief body from the ticket title, the request and the optional assignment and mandate', () => {
+  const body = composeBriefBody({ title: 'Parser crashes', assignment: 'Routing note: keep it small', mandate: 'Limited authority.',
+    request: 'The login page crashes when I submit the form.' })
+  for (const piece of ['Parser crashes', 'Routing note: keep it small', 'Limited authority.', 'The login page crashes when I submit the form.'])
+    expect(body).toContain(piece)
+  // assignment 为空时不留空标题：brief 里不该出现没有内容的 “assignment：”。
+  const bare = composeBriefBody({ title: 'T', assignment: '  ', request: 'R' })
+  expect(bare).not.toContain('assignment：')
+})
+
+it('names the total length and the full-text path when the request was capped', () => {
+  const body = composeBriefBody({ title: 'T', request: 'head', requestChars: 9_000, requestRead: '/state/worker-briefs/t1.md' })
+  expect(body).toContain('请求正文共 9000 字')
+  expect(body).toContain('/state/worker-briefs/t1.md')
+})
+
+it('keeps the ticket request in the brief when ticketExecution carries no assignment for an explicit ticket', () => {
+  // 产品路径回归：explicit 票的 execution.assignment 为空，请求只能用 origin trigger 补进 brief。
+  const ticket = {
+    id: 't1', title: 'Parser crashes', decisionId: 'd',
+    mandate: { strength: 'explicit', policyVersion: 'v', basis: { via: 'addressed', addressed: 'direct' }, actor: { source: 's', id: 'a' }, scope: 's' },
+    origin: { triggerId: 'trig-1', triggerIds: ['trig-1'] },
+  } as unknown as Ticket
+  const execution = ticketExecution(ticket, { kind: 'accept', title: 'Parser crashes', scope: 's', reason: 'r', name: 'parser-crash' },
+    SettingsSchema.parse({}), '/tmp/state')
+  expect(execution.assignment).toBe('')
+  const brief = buildWorkerBrief(composeBriefBody({ title: ticket.title, assignment: execution.assignment, request: 'The login page crashes.' }))
+  expect(brief).toContain('The login page crashes.')
+  expect(brief).toContain('RESULT')
 })

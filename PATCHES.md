@@ -64,11 +64,13 @@ explicitly set `kind: 'zcode'`. Decisions in ADR-0011 of
 - `src/executor/execution-shared.ts` — the execution contract the two
   executors share (`ticketExecution`, `prepareDirectory`, `PrepareFailed`)
 - `src/executor/zcode.ts` — the `ZcodeExecutor` itself: in-memory queue under
-  `maxWorkers`, one zcode run per assignment, resume-or-`blocked` deliveries,
-  stop aborts without reporting
+  `maxWorkers`, one zcode run per assignment (the brief carries the ticket's
+  origin request, capped with the full text written under `<stateDir>/worker-briefs`),
+  resume-or-`blocked` deliveries, stop aborts without reporting
 - `src/executor/zcode-backend.ts` — the process backend: the argv contract and
   `runZcodeRun`, which reads one run as an NDJSON stream
-- `src/executor/zcode-report.ts` — the plain-text contract: `buildWorkerBrief`,
+- `src/executor/zcode-report.ts` — the plain-text contract: `composeBriefBody`
+  (title + assignment + mandate + the origin request), `buildWorkerBrief`,
   `parseResultBlock`, `mapToWorkerReport` (never guesses `ready`)
 - `tests/worker-backend.spec.ts`, `tests/worker-report.spec.ts`,
   `tests/worker-config.spec.ts`, `tests/worker-executor.spec.ts` — port-level

@@ -4,6 +4,7 @@
  * 队列并立即返回；真正的进程由受 settings.maxWorkers 约束的派发循环异步驱动。会话 id 只存在内存里，
  * 队列同样不跨进程重启，重启后的续跑语义 ADR-0011 尚未覆盖。
  */
+import { mkdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -13,9 +14,9 @@ import type { Machine } from '../deployment.ts'
 import { ZCODE_DEFAULTS } from '../policy.ts'
 import type { Store } from '../app/store.ts'
 import type { Variable } from '../app/execution-environment.ts'
-import { prepareDirectory, ticketExecution } from './execution-shared.ts'
+import { mandateInstructions, prepareDirectory, ticketExecution } from './execution-shared.ts'
 import { buildZcodeArgv, runZcodeRun, type ZcodeRunResult } from './zcode-backend.ts'
-import { buildWorkerBrief, mapToWorkerReport, parseResultBlock } from './zcode-report.ts'
+import { buildWorkerBrief, composeBriefBody, mapToWorkerReport, parseResultBlock } from './zcode-report.ts'
 
 /** What the zcode executor's host must provide. */
 export interface ZcodeHost {
@@ -32,6 +33,12 @@ export interface ZcodeHost {
 }
 /** Expands a leading `~` of a configured command to the host user's home directory; `~user` paths stay as written. */
 const expandHome = (command: string): string => command === '~' || command.startsWith('~/') ? join(homedir(), command.slice(1)) : command
+/** 首发 brief 里原始请求的字符上限：`-p` 走 argv，长 issue 正文必须截断；被截断时全文另落 stateDir 供 worker 自己读。 */
+const REQUEST_CHARS = 6_000
+/** 请求的截断结果：`truncated` 为真时 `text` 只是开头，`chars` 是原文总长。 */
+const capRequest = (text: string): { text: string; chars: number; truncated: boolean } => text.length <= REQUEST_CHARS
+  ? { text, chars: text.length, truncated: false }
+  : { text: text.slice(0, REQUEST_CHARS), chars: text.length, truncated: true }
 /** 队列里的一项工作：start 的首发，或 deliver 的续跑。 */
 interface QueuedStart { kind: 'start'; ticketId: string; assignmentId: string }
 /** deliver 的队列项；inputIds 在派发时从票上快照，供 inputsDelivered/inputsRead。 */
@@ -51,7 +58,7 @@ const deliveryBlocker = (sessionId: string | undefined): string | undefined =>
  * A zcode-backed executor: `start` launches one zcode run per assignment and `deliver` resumes the ticket's recorded
  * zcode session with the undelivered inputs, both through an in-memory queue driven under the `maxWorkers` limit.
  * A delivery that arrives while the ticket's run is in flight waits in the queue and resumes once that run settles,
- * because the first run's brief carries only the assignment text; one with no session to resume reports `blocked`
+ * because the first run's brief carries only the origin request (no later inputs); one with no session to resume reports `blocked`
  * instead of `deliveryFailed` (ADR-0011), and a failed launch is reported without retries because a half-prepared
  * workspace must not be treated as prepared. `prepare` fills the ticket's execution metadata through the shared
  * execution contract.
@@ -171,6 +178,21 @@ export class ZcodeExecutor implements Executor {
       this.reportFailure(work, entry, error)
     }
   }
+  /** 本票 origin trigger 的正文；取不到时给可读的占位，不静默发出一张空任务。 */
+  private requestText(ticket: Ticket): string {
+    const trigger = this.host.store.triggers.get(ticket.origin.triggerId)
+    return trigger ? `${trigger.actor.id}: ${trigger.text}` : `[origin request ${ticket.origin.triggerId} is not available]`
+  }
+  /** 请求被截断时把全文写进 stateDir，供 worker 自己读；写失败返回 undefined，run 仍按截断后的 brief 进行。 */
+  private async writeFullRequest(ticket: Ticket, text: string): Promise<string | undefined> {
+    const directory = join(this.host.machine.stateDir, 'worker-briefs')
+    const path = join(directory, `${ticket.id.replace(/[^A-Za-z0-9._-]/g, '_')}.md`)
+    try {
+      await mkdir(directory, { recursive: true })
+      await writeFile(path, `${text}\n`, 'utf8')
+      return path
+    } catch { return undefined }
+  }
   /** 首发一次 zcode run：先备好工作目录，再 assignmentStarted，run 结束后 turnEnded 与 report。 */
   private async runStart(work: QueuedStart, entry: RunEntry): Promise<void> {
     const ticket = this.host.store.tickets.get(work.ticketId)
@@ -183,7 +205,17 @@ export class ZcodeExecutor implements Executor {
     if (!current || entry.stopped || !this.currentAssignment(current, work)) return
     this.host.store.atomic(() => { this.host.engine.assignmentStarted(work.ticketId, work.assignmentId) })
     const directory = current.execution?.directory ?? ''
-    const argv = buildZcodeArgv({ brief: buildWorkerBrief(current.execution?.assignment ?? ''), cwd: directory, command: this.command })
+    // 请求正文来自 origin trigger：execution.assignment 只带路由注记（原型由 launch 单独投递 trigger），
+    // 少了它 worker 收到的就是一张没有任务的票。长正文截断，全文落 stateDir 并给出路径。
+    const origin = this.requestText(current)
+    const request = capRequest(origin)
+    const read = request.truncated ? await this.writeFullRequest(current, origin) : undefined
+    // 写全文期间票可能被停掉：spawn 前再确认一次，避免为已结束的票起进程。
+    if (entry.stopped) return
+    const body = composeBriefBody({ title: current.title, assignment: current.execution?.assignment,
+      mandate: mandateInstructions(current.mandate), request: request.text,
+      ...(request.truncated ? { requestChars: request.chars, requestRead: read } : {}) })
+    const argv = buildZcodeArgv({ brief: buildWorkerBrief(body), cwd: directory, command: this.command })
     const run = runZcodeRun(this.host.context.subprocess, { argv, cwd: directory, signal, timeoutMs: this.timeoutMs })
     const outcome = await run.done
     this.finish(work, entry, outcome)
@@ -214,7 +246,7 @@ export class ZcodeExecutor implements Executor {
     const outcome = await run.done
     this.finish(work, entry, outcome)
   }
-  /** run 结束后的记账：stopped 或票已变则不再 report（也不记它的会话）；首发 turnEnded 在前，续跑 inputsRead 与 report 同事务。 */
+  /** run 结束后的记账：stopped 或票已变则不再 report（也不记它的会话）；两种 run 都先记 turnEnded，续跑再记 inputsRead 与 report。 */
   private finish(work: QueuedWork, entry: RunEntry, outcome: ZcodeRunResult): void {
     if (entry.stopped) return
     const ticket = this.host.store.tickets.get(work.ticketId)
@@ -226,6 +258,8 @@ export class ZcodeExecutor implements Executor {
       this.host.store.atomic(() => { this.host.engine.turnEnded(work.ticketId, work.assignmentId) })
       this.host.store.atomic(() => { this.host.engine.report(work.ticketId, report) })
     } else {
+      // 续跑也是一次 worker turn：与首发一样先记 turnEnded（assignment.idleAt 与面板时长用它），再记 inputsRead 与 report。
+      this.host.store.atomic(() => { this.host.engine.turnEnded(work.ticketId, work.assignmentId) })
       this.host.store.atomic(() => {
         this.host.engine.inputsRead(work.ticketId, work.inputIds)
         this.host.engine.report(work.ticketId, report)
