@@ -81,7 +81,11 @@ explicitly set `kind: 'zcode'`. Decisions in ADR-0011 of
   the E2E run method
 
 This is a feature-branch patch record: it takes effect when the fork pin moves
-to a commit containing it (ADR-0007 pinning).
+to a commit containing it (ADR-0007 pinning). Before moving the pin, run the
+real end-to-end once on the exact commit being pinned
+(`ZCODE_E2E=1 pnpm vitest run tests/worker-e2e.spec.ts`): it is the only check
+that a production brief makes ZCode read the ticket request and finish with a
+RESULT block.
 
 ### Environment note (not a source patch)
 

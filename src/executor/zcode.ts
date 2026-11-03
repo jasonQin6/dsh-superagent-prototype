@@ -28,6 +28,8 @@ export interface ZcodeHost {
   readonly machine: Pick<Machine, 'stateDir'>
   /** The host's lifetime signal; a run's own signal is combined with it so a host stop also ends runs. */
   readonly lifetime: AbortSignal
+  /** Whether processing is paused: queued work waits for `wake()` instead of dispatching, as the DSH executor's effects do. */
+  paused(): boolean
   /** Execution environment variables for `ticket`, passed to its workspace prepare command. */
   environment(ticket: Ticket): Variable[]
 }
@@ -106,6 +108,8 @@ export class ZcodeExecutor implements Executor {
   install(): void {}
   /** The queue and the session ids live only in memory, so a restart reconciles nothing. */
   resume(): void {}
+  /** Dispatch again after processing resumes: `pump()` holds queued work while paused and nothing else would restart it. */
+  wake(): void { this.pump() }
   /** Aborts every in-flight run and waits for their streams to settle. */
   async shutdown(): Promise<void> {
     const entries = [...this.runs.values()]
@@ -132,6 +136,8 @@ export class ZcodeExecutor implements Executor {
   private pump(): void {
     for (;;) {
       if (this.host.lifetime.aborted) { this.waiting.length = 0; return }
+      // 暂停时不派发：队列原地保留，恢复后由 `wake()` 再驱动一次（运行中的 run 不受影响，与 DSH 的 pause 语义一致）。
+      if (this.host.paused()) return
       while (this.waiting.length) {
         const head = this.waiting[0]!
         const ticket = this.host.store.tickets.get(head.ticketId)

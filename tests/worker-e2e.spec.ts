@@ -23,7 +23,7 @@ const RUN_TIMEOUT_MS = 600_000
 const E2E_TIMEOUT_MS = RUN_TIMEOUT_MS + 60_000
 /** 给 worker 的任务：小而确定，真机 zcode 在 yolo 模式下应能一次完成并按约定收尾。
  * 故意不在这里复述 RESULT 块格式：块约定只来自 buildWorkerBrief 的固定尾部指令，E2E 要证明的就是生产 brief 单独足以让 worker 按约收尾。 */
-const ASSIGNMENT = '在当前工作目录创建文件 notes.md，写入一行 "worker was here"，git add 并 commit（不要 push）。'
+const ASSIGNMENT = '在当前工作目录创建文件 notes.md，写入一行 "worker was here"，git add 并 commit。这个临时仓库没有远端：不要 push，也不要开 PR。'
 
 /** Promise 化地跑一条外部命令，失败时把 stderr 带进错误；测试文件可以用 child_process，git 设置与取证都走这里。 */
 const run = (file: string, args: readonly string[], cwd?: string): Promise<string> =>
@@ -146,6 +146,7 @@ describe.skipIf(!process.env.ZCODE_E2E)('ZcodeExecutor end-to-end（真实 zcode
       },
       machine: { stateDir: join(root, 'state') },
       lifetime: new AbortController().signal,
+      paused: () => false,
       environment: (ticket: Ticket) => [variable('DSH_SUPERAGENT_DIR', ticket.execution?.directory ?? ''),
         variable('DSH_SUPERAGENT_NAME', ticket.execution?.name ?? '')],
     } as unknown as ZcodeHost

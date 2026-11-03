@@ -78,7 +78,8 @@ function fakeSubprocess() {
 interface Recorded { call: string, args: unknown[] }
 
 /** 一套端口级 harness：fake subprocess + 录音 engine + 手工 store，装配出被测的 ZcodeExecutor。 */
-function harness(options: { settings?: Settings, tickets?: Ticket[], triggers?: Record<string, Trigger>, lifetime?: AbortSignal, stateful?: boolean } = {}) {
+function harness(options: { settings?: Settings, tickets?: Ticket[], triggers?: Record<string, Trigger>, lifetime?: AbortSignal, stateful?: boolean,
+  paused?: () => boolean } = {}) {
   const log: Recorded[] = []
   const record = (call: string) => (...args: unknown[]) => { log.push({ call, args }) }
   const store = {
@@ -111,6 +112,7 @@ function harness(options: { settings?: Settings, tickets?: Ticket[], triggers?: 
     context: { subprocess: fake.runtime }, engine, store,
     machine: { stateDir: join(tmpdir(), 'zcode-executor-spec-state') },
     lifetime: options.lifetime ?? new AbortController().signal,
+    paused: options.paused ?? (() => false),
     environment: () => [],
   } as unknown as ZcodeHost
   return { executor: new ZcodeExecutor(host), log, fake }
@@ -174,6 +176,24 @@ describe('ZcodeExecutor.start', () => {
     const run = zcodeRuns(fake)[0]!
     run.write(`${resultLine('sess_1', readyText)}\n`)
     run.settle({ exitCode: 0, signal: null })
+  })
+  it('holds queued work while processing is paused and dispatches it on wake', async () => {
+    let paused = true
+    const t = ticket('t1')
+    const { executor, fake } = harness({ tickets: [t], paused: () => paused })
+    executor.start(t, t.assignments[0]!)
+    await wait(40)
+    // 暂停中：连 prepare 都不该发起，队列原地保留。
+    expect(fake.spawns.length).toBe(0)
+    paused = false
+    executor.wake()
+    await eventually(() => fake.spawns.length === 1)
+    fake.spawns[0]!.settle({ exitCode: 1, signal: null })
+    await eventually(() => zcodeRuns(fake).length === 1)
+    const run = zcodeRuns(fake)[0]!
+    run.write(`${resultLine('sess_1', readyText)}\n`)
+    run.settle({ exitCode: 0, signal: null })
+    await wait(20)
   })
   it('reports through a stateful engine that has flipped the assignment to running (regression)', async () => {
     const t = ticket('t1')

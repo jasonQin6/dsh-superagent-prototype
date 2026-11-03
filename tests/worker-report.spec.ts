@@ -56,6 +56,19 @@ it('maps a parsed ready result to ready only on a clean exit', () => {
   expect(mapToWorkerReport({ parsed: parseResultBlock(block('ready')), exitCode: 0, timedOut: false })).toMatchObject({ state: 'ready' })
 })
 
+it('maps a parsed dropped result through on a clean exit', () => {
+  // dropped 让票直接结束、不叫人：worker 判断"无事可做/请求不成立"时用它，而不是 failed。
+  expect(mapToWorkerReport({ parsed: parseResultBlock(block('dropped')), exitCode: 0, timedOut: false }).state).toBe('dropped')
+})
+
+it('tells the worker to push the branch and open a draft PR before reporting ready', () => {
+  const brief = buildWorkerBrief(composeBriefBody({ title: 'T', request: 'R' }))
+  expect(brief).toContain('push')
+  expect(brief).toContain('draft PR')
+  expect(brief).toContain('RESULT 的 pr')
+  expect(brief).toContain('blocked')
+})
+
 it('maps a parsed blocked or failed result through on a clean exit', () => {
   expect(mapToWorkerReport({ parsed: parseResultBlock(block('blocked')), exitCode: 0, timedOut: false }).state).toBe('blocked')
   expect(mapToWorkerReport({ parsed: parseResultBlock(block('failed')), exitCode: 0, timedOut: false }).state).toBe('failed')

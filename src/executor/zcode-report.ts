@@ -5,18 +5,23 @@ import type { ReportState } from '../core/model.ts'
 /** RESULT 块六个键的恰序，构造与解析共用；顺序错即视为违反约定而不是宽容修正。 */
 const KEYS = ['status', 'summary', 'branch', 'head', 'pr', 'next'] as const
 type ResultKey = (typeof KEYS)[number]
-/** 解析成功的一个 RESULT 块：`status` 限于三种终态，其余字段为逐字值，无信息时是字面 `none`。 */
-export interface ParsedResult { status: 'ready' | 'blocked' | 'failed'; summary: string; branch: string; head: string; pr: string; next: string }
+/** 解析成功的一个 RESULT 块：`status` 限于四种终态，其余字段为逐字值，无信息时是字面 `none`。 */
+export interface ParsedResult { status: 'ready' | 'blocked' | 'failed' | 'dropped'; summary: string; branch: string; head: string; pr: string; next: string }
 
 /** 发给 worker 的固定尾部指令。为什么固定：worker 的回复是唯一的回传通道，结尾约定必须逐字稳定，解析端才能机器可判。
  * 头行必须点名：真机首跑发现模型会省略字面 RESULT 头而只给普通围栏，严格解析器按设计拒绝——指令必须把头行钉死。 */
 const BRIEF_TAIL = ['', '完成后，在回复的最后输出一个 RESULT 块。块的第一行必须恰为字面 RESULT（整行只有这一个词；若用围栏，开头写成 ```RESULT）：',
   '随后共六行，每行格式恰为 key: value（冒号加空格），键的顺序必须是：',
-  'status: 只能是 ready、blocked、failed 之一', 'summary: 一句话结果', 'branch: 分支名', 'head: 最新提交的提交号', 'pr: PR 编号或链接',
-  'next: 建议的下一步', '没有对应信息时该行的值写 none；RESULT 头行与六个键一行都不可省略。'].join('\n')
+  'status: 只能是 ready、blocked、failed、dropped 之一', 'summary: 一句话结果', 'branch: 分支名', 'head: 最新提交的提交号', 'pr: PR 编号或链接',
+  'next: 建议的下一步',
+  'dropped 只在没有可交付的改动或无事可做时用（请求不成立、已被别处完成），它让票直接结束、不打扰人；其余情况用 ready 或 blocked。',
+  '没有对应信息时该行的值写 none；RESULT 头行与六个键一行都不可省略。'].join('\n')
 
-/** 发给 worker 的固定开头：一次性进程没有 session 级提示词，工作区与提交约定只能在这里说清。 */
+/** 发给 worker 的固定开头：一次性进程没有 session 级提示词，工作区、提交与交付约定只能在这里说清。 */
 const BRIEF_INTRO = '你在下面这个工作目录里完成一张工单的请求。改动提交到当前分支；不要新建 worktree、不要切换分支、不要合并。'
+/** 交付约定：与 DSH worker 一致，代码改动要 push 并开 draft PR，否则 ready 的票会以"本地提交"收尾、交付链断在本地。 */
+const BRIEF_DELIVERY = '交付：代码改动提交后把当前分支 push 到 origin，并用 gh 开一个 draft PR，把 PR 链接写进 RESULT 的 pr 字段；'
+  + 'push 或开 PR 失败就报 blocked 并在 summary 里写清失败原因。不要合并、不要开 auto-merge。'
 
 /** composeBriefBody 的输入：票面、assignment、授权说明与原始请求；请求被截断时再带上总数与全文位置。 */
 export interface WorkerBriefBody {
@@ -40,7 +45,7 @@ export interface WorkerBriefBody {
  * 而 ZCode 没有那条投递通道，请求正文只能由 brief 补上，否则 worker 收到的是一张没有任务的票。
  */
 export function composeBriefBody({ title, assignment, mandate, request, requestChars, requestRead }: WorkerBriefBody): string {
-  const parts = [BRIEF_INTRO, `工单：${title}`]
+  const parts = [BRIEF_INTRO, BRIEF_DELIVERY, `工单：${title}`]
   const note = assignment?.trim()
   if (note) parts.push(`assignment：${note}`)
   if (mandate) parts.push(mandate)
@@ -80,7 +85,7 @@ export function parseResultBlock(text: string): ParsedResult | null {
   }
   const { status } = values
   // 块后的围栏收尾与尾随文本不校验：解析在第六个键后即结束，后面是什么与结果无关。
-  if (status !== 'ready' && status !== 'blocked' && status !== 'failed') return null
+  if (status !== 'ready' && status !== 'blocked' && status !== 'failed' && status !== 'dropped') return null
   // status 放在展开之后：让收窄出的三值字面量类型留在返回值里，不被 Record 的 string 覆盖。
   return { ...values, status }
 }
@@ -126,7 +131,7 @@ export function mapToWorkerReport({ parsed, exitCode, timedOut, stderrTail, outp
       ? 'worker 已结束，输出超过收集上限被截断，RESULT 块可能因此丢失。'
       : 'worker 已结束，但回复中没有可解析的 RESULT 块（缺失或不符合六行键序约定）。', stderrTail),
   }
-  // 块的 status 只可能是三种终态之一，state 因此不会出现 ready 之外的猜测路径。
+  // 块的 status 只可能是四种终态之一，state 因此不会出现 ready 之外的猜测路径。
   const state: ReportState = parsed.status
   return { state, summary: composeSummary(parsed) }
 }
